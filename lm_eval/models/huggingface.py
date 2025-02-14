@@ -12,6 +12,7 @@ from accelerate import (
     Accelerator,
     InitProcessGroupKwargs,
     find_executable_batch_size,
+    DistributedType
 )
 from accelerate.utils import get_max_memory
 from huggingface_hub import HfApi
@@ -57,6 +58,10 @@ class HFLM(TemplateLM):
     def __init__(
         self,
         pretrained: Union[str, transformers.PreTrainedModel],
+        ############## add start ##############
+        own_accelerator: Optional[Accelerator] = None,
+        wrapped_model=None,
+        ############## add end ##############
         backend: Literal["default", "causal", "seq2seq"] = "default",
         # override whether the model should be treated as decoder-only (causal) or encoder-decoder (seq2seq)
         revision: Optional[str] = "main",
@@ -96,16 +101,26 @@ class HFLM(TemplateLM):
         super().__init__()
         # optionally: take in an already-initialized transformers.PreTrainedModel
         if not isinstance(pretrained, str):
-            eval_logger.warning(
-                "`pretrained` model kwarg is not of type `str`. Many other model arguments may be ignored. Please do not launch via accelerate or use `parallelize=True` if passing an existing model this way."
-            )
+            ############## remove start ##############
+            # eval_logger.warning(
+            #     "`pretrained` model kwarg is not of type `str`. Many other model arguments may be ignored. Please do not launch via accelerate or use `parallelize=True` if passing an existing model this way."
+            # )
+            ############## remove end ##############
             assert not parallelize, (
                 "`parallelize=True` is not compatible with passing pre-initialized model to `pretrained`"
             )
             self._model = pretrained
             self._device = self._model.device
             self._config = self._model.config
-            gpus = 0
+            ############## remove start ##############
+            # gpus = 0
+            ############## remove end ##############
+            ############## add start ##############
+            if own_accelerator is None:
+                gpus = 0
+            else:
+                gpus = torch.cuda.device_count()
+            ############## add end ##############
 
         else:
             assert isinstance(device, str)
@@ -281,12 +296,34 @@ class HFLM(TemplateLM):
                     self._rank = 0
                     self._world_size = 1
         else:
+            ############## remove start ##############
             # if a PreTrainedModel was passed into HFLM, we forgo distributed setup.
-            eval_logger.warning(
-                "Passed an already-initialized model through `pretrained`, assuming single-process call to evaluate() or custom distributed integration"
-            )
-            self._rank = 0
-            self._world_size = 1
+            # eval_logger.warning(
+            #     "Passed an already-initialized model through `pretrained`, assuming single-process call to evaluate() or custom distributed integration"
+            # )
+            # self._rank = 0
+            # self._world_size = 1
+            ############## remove end ##############
+            ############## add start ##############
+            if own_accelerator is not None and gpus > 1:
+                if own_accelerator.num_processes == 1:
+                    self._rank = 0
+                    self._world_size = 1
+                else:
+                    assert (own_accelerator.distributed_type in [DistributedType.MULTI_GPU]), "Unsupported distributed type provided. Only DDP and FSDP are supported."
+                    self._model = wrapped_model
+                    self._device = torch.device(f"cuda:{own_accelerator.local_process_index}")
+                    self.accelerator = own_accelerator
+
+                    if self.accelerator.is_local_main_process:
+                        eval_logger.info(f"Using {gpus} devices with data parallelism")
+
+                    self._rank = self.accelerator.local_process_index
+                    self._world_size = self.accelerator.num_processes
+            else:
+                self._rank = 0
+                self._world_size = 1
+            ############## add end ##############
 
         self.custom_prefix_token_id = prefix_token_id
         if prefix_token_id is not None:
